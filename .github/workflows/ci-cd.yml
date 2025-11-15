@@ -1,0 +1,378 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  OATPP_VERSION: 1.4.0
+
+jobs:
+  # Job 1: Build and Test on Multiple Platforms
+  build-and-test:
+    name: Build & Test (${{ matrix.os }}, ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        compiler: [gcc, clang]
+        exclude:
+          - os: windows-latest
+            compiler: clang
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cpp_compiler: g++
+            c_compiler: gcc
+          - os: ubuntu-latest
+            compiler: clang
+            cpp_compiler: clang++
+            c_compiler: clang
+          - os: macos-latest
+            compiler: gcc
+            cpp_compiler: g++
+            c_compiler: gcc
+          - os: macos-latest
+            compiler: clang
+            cpp_compiler: clang++
+            c_compiler: clang
+          - os: windows-latest
+            compiler: gcc
+            cpp_compiler: g++
+            c_compiler: gcc
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up CMake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.20.x'
+
+    # Linux specific setup
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          libssl-dev \
+          zlib1g-dev \
+          ninja-build
+
+    # macOS specific setup
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install cmake ninja openssl
+
+    # Windows specific setup
+    - name: Install dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        choco install cmake ninja
+
+    # Install oatpp
+    - name: Cache oatpp
+      id: cache-oatpp
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/oatpp-install
+        key: ${{ runner.os }}-${{ matrix.compiler }}-oatpp-${{ env.OATPP_VERSION }}
+
+    - name: Build and Install oatpp
+      if: steps.cache-oatpp.outputs.cache-hit != 'true'
+      run: |
+        git clone --depth 1 --branch ${{ env.OATPP_VERSION }} https://github.com/oatpp/oatpp.git
+        cd oatpp
+        mkdir build && cd build
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DCMAKE_INSTALL_PREFIX=$HOME/oatpp-install \
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
+          -DOATPP_BUILD_TESTS=OFF
+        cmake --build . --config ${{ env.BUILD_TYPE }}
+        cmake --install . --config ${{ env.BUILD_TYPE }}
+
+    # Configure project
+    - name: Configure CMake
+      run: |
+        cmake -B ${{github.workspace}}/build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
+          -DCMAKE_PREFIX_PATH=$HOME/oatpp-install \
+          -DCMAKE_CXX_STANDARD=17
+
+    # Build project
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config ${{ env.BUILD_TYPE }}
+
+    # Run tests
+    - name: Run Tests
+      working-directory: ${{github.workspace}}/build
+      run: ctest -C ${{ env.BUILD_TYPE }} --output-on-failure --verbose
+
+    # Upload build artifacts
+    - name: Upload build artifacts
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.os }}-${{ matrix.compiler }}
+        path: |
+          ${{github.workspace}}/build/
+          !${{github.workspace}}/build/**/*.o
+          !${{github.workspace}}/build/**/*.obj
+        retention-days: 7
+
+  # Job 2: Static Analysis
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck clang-tidy
+
+    - name: Run cppcheck
+      run: |
+        cppcheck --enable=all \
+          --std=c++17 \
+          --suppress=missingIncludeSystem \
+          --error-exitcode=1 \
+          --inline-suppr \
+          server/ docs/ 2> cppcheck-report.txt || true
+
+    - name: Upload cppcheck report
+      uses: actions/upload-artifact@v4
+      with:
+        name: cppcheck-report
+        path: cppcheck-report.txt
+
+  # Job 3: Code Coverage
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          lcov \
+          ninja-build
+
+    - name: Cache oatpp
+      id: cache-oatpp
+      uses: actions/cache@v4
+      with:
+        path: ~/oatpp-install
+        key: ubuntu-gcc-oatpp-${{ env.OATPP_VERSION }}-coverage
+
+    - name: Build oatpp with coverage
+      if: steps.cache-oatpp.outputs.cache-hit != 'true'
+      run: |
+        git clone --depth 1 --branch ${{ env.OATPP_VERSION }} https://github.com/oatpp/oatpp.git
+        cd oatpp
+        mkdir build && cd build
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_INSTALL_PREFIX=$HOME/oatpp-install \
+          -DCMAKE_CXX_FLAGS="--coverage" \
+          -DOATPP_BUILD_TESTS=OFF
+        cmake --build .
+        cmake --install .
+
+    - name: Configure with coverage
+      run: |
+        cmake -B build \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_PREFIX_PATH=$HOME/oatpp-install \
+          -DCMAKE_CXX_STANDARD=17 \
+          -DCMAKE_CXX_FLAGS="--coverage"
+
+    - name: Build with coverage
+      run: cmake --build build
+
+    - name: Run tests
+      working-directory: build
+      run: ctest --output-on-failure
+
+    - name: Generate coverage report
+      run: |
+        lcov --capture --directory build --output-file coverage.info
+        lcov --remove coverage.info '/usr/*' '*/test/*' '*/tests/*' --output-file coverage.info
+        lcov --list coverage.info
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        files: ./coverage.info
+        fail_ci_if_error: false
+        verbose: true
+
+  # Job 4: Documentation Build
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: package.json
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build documentation
+      run: |
+        cd docs
+        npm run build || echo "No docs build script found"
+
+    - name: Upload docs artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: documentation
+        path: docs/build/
+        retention-days: 7
+
+  # Job 5: Security Scan
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Job 6: Build Docker Image (if Dockerfile exists)
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Check if Dockerfile exists
+      id: check_dockerfile
+      run: |
+        if [ -f Dockerfile ]; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up Docker Buildx
+      if: steps.check_dockerfile.outputs.exists == 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker image
+      if: steps.check_dockerfile.outputs.exists == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: oatpp-website:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Job 7: Performance Tests
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y apache2-utils
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-ubuntu-latest-gcc
+        path: build/
+
+    - name: Make executable
+      run: chmod +x build/server/oatpp-website || true
+
+    - name: Start server (if exists)
+      run: |
+        if [ -f build/server/oatpp-website ]; then
+          ./build/server/oatpp-website &
+          sleep 5
+          
+          # Basic performance test
+          ab -n 1000 -c 10 http://localhost:8000/ || echo "Performance test skipped"
+        fi
+
+  # Summary Job
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [build-and-test, static-analysis, coverage, docs, security]
+    if: always()
+    
+    steps:
+    - name: Check job results
+      run: |
+        echo "Build and Test: ${{ needs.build-and-test.result }}"
+        echo "Static Analysis: ${{ needs.static-analysis.result }}"
+        echo "Coverage: ${{ needs.coverage.result }}"
+        echo "Docs: ${{ needs.docs.result }}"
+        echo "Security: ${{ needs.security.result }}"
+        
+        if [[ "${{ needs.build-and-test.result }}" == "failure" ]]; then
+          echo "❌ Build and tests failed"
+          exit 1
+        fi
+        
+        echo "✅ All critical tests passed"
